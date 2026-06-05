@@ -1,0 +1,30 @@
+# Virtual environment
+.venv/
+
+# Vivado generated files
+Implementation/logs/*
+Implementation/MMU64.cache/
+Implementation/MMU64.hw/
+Implementation/MMU64.ip_user_files/
+Implementation/MMU64.sim/
+Implementation/MMU64.runs/
+Implementation/MMU64.srcs/
+Implementation/MMU64.ioplanning/
+Implementation/.Xil/
+
+# Simulation outputs
+Implementation/testbench/*.log
+Implementation/testbench/*.wlf
+Implementation/testbench/work/
+
+# OS generated
+.DS_Store
+Thumbs.db
+
+# IDE
+*.swp
+*.swo
+*~
+
+# ModelSim
+work/
