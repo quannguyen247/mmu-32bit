@@ -50,6 +50,7 @@ module mmu64_top #(
 
     // ---- SATP fields ----
     wire [3:0]              satp_mode = satp[`SATP_MODE];
+    wire [15:0]             satp_asid = satp[`SATP_ASID];
     wire [`PPN_WIDTH-1:0]   satp_ppn  = satp[`SATP_PPN];
 
     // ---- Kiem tra translation co duoc bat khong ----
@@ -65,8 +66,8 @@ module mmu64_top #(
 
     // ---- Registered VA (giu khi walk) ----
     reg [`VA_WIDTH-1:0]  va_reg;
-    reg [1:0]            acc_reg;
-    reg [1:0]            priv_reg;
+    reg [15:0]           asid_reg;
+    reg                  kill_walk;
 
     wire [`VPN_TOTAL_W-1:0] va_reg_vpn = {va_reg[38:30], va_reg[29:21], va_reg[20:12]};
 
@@ -84,13 +85,17 @@ module mmu64_top #(
     reg [7:0]              tlb_wr_flags;
     reg [1:0]              tlb_wr_pgsz;
 
+    wire tlb_lookup_req = (state == ST_IDLE) && req && !sfence_vma &&
+                          translation_en && va_valid;
+
     mmu64_tlb #(
         .ENTRIES(TLB_ENTRIES)
     ) u_tlb (
         .clk            (clk),
         .rst_n          (rst_n),
         .lookup_vpn     (va_vpn),       // Dung VA truc tiep (combinational)
-        .lookup_req     (req),
+        .lookup_req     (tlb_lookup_req),
+        .lookup_asid    (satp_asid),
         .lookup_hit     (tlb_hit),
         .lookup_ppn     (tlb_ppn),
         .lookup_flags   (tlb_flags),
@@ -100,7 +105,24 @@ module mmu64_top #(
         .write_ppn      (tlb_wr_ppn),
         .write_flags    (tlb_wr_flags),
         .write_page_size(tlb_wr_pgsz),
+        .write_asid     (asid_reg),
         .flush          (sfence_vma)
+    );
+
+    // TLB hit still needs permission checking for the current access.
+    wire tlb_perm_fault;
+    mmu64_perm_check u_tlb_perm(
+        .access_type (access_type),
+        .priv_mode   (priv_mode),
+        .pte_r       (tlb_flags[`PTE_R]),
+        .pte_w       (tlb_flags[`PTE_W]),
+        .pte_x       (tlb_flags[`PTE_X]),
+        .pte_u       (tlb_flags[`PTE_U]),
+        .pte_a       (tlb_flags[`PTE_A]),
+        .pte_d       (tlb_flags[`PTE_D]),
+        .mstatus_sum (mstatus_sum),
+        .mstatus_mxr (mstatus_mxr),
+        .fault       (tlb_perm_fault)
     );
 
     // ---- TLB hit: tinh PA tu PPN + VA offset ----
@@ -117,20 +139,22 @@ module mmu64_top #(
     // ============================================================
     //  Walker Instance
     // ============================================================
-    reg                   walk_start;
+    wire                  walk_start;
     wire                  walk_done;
     wire                  walk_fault;
     wire [`PPN_WIDTH-1:0] walk_ppn;
     wire [7:0]            walk_flags;
     wire [1:0]            walk_pgsz;
 
+    assign walk_start = tlb_lookup_req && !tlb_hit;
+
     mmu64_walker u_walker(
         .clk            (clk),
         .rst_n          (rst_n),
         .walk_req       (walk_start),
-        .vpn            (va_reg_vpn),
-        .access_type    (acc_reg),
-        .priv_mode      (priv_reg),
+        .vpn            (va_vpn),
+        .access_type    (access_type),
+        .priv_mode      (priv_mode),
         .satp_ppn       (satp_ppn),
         .mstatus_sum    (mstatus_sum),
         .mstatus_mxr    (mstatus_mxr),
@@ -159,7 +183,7 @@ module mmu64_top #(
     // ============================================================
     //  Main FSM
     // ============================================================
-    assign ready = (state == ST_IDLE);
+    assign ready = (state == ST_IDLE) && !sfence_vma;
 
     always @(posedge clk) begin
         if (!rst_n) begin
@@ -167,11 +191,10 @@ module mmu64_top #(
             pa          <= {`PA_WIDTH{1'b0}};
             pa_valid    <= 1'b0;
             page_fault  <= 1'b0;
-            walk_start  <= 1'b0;
             tlb_we      <= 1'b0;
             va_reg      <= {`VA_WIDTH{1'b0}};
-            acc_reg     <= 2'b00;
-            priv_reg    <= 2'b00;
+            asid_reg    <= 16'd0;
+            kill_walk   <= 1'b0;
             tlb_wr_vpn  <= {`VPN_TOTAL_W{1'b0}};
             tlb_wr_ppn  <= {`PPN_WIDTH{1'b0}};
             tlb_wr_flags<= 8'h0;
@@ -180,7 +203,6 @@ module mmu64_top #(
             // Xoa pulse moi cycle
             pa_valid   <= 1'b0;
             page_fault <= 1'b0;
-            walk_start <= 1'b0;
             tlb_we     <= 1'b0;
 
             case (state)
@@ -188,11 +210,11 @@ module mmu64_top #(
                 //  IDLE: cho request tu CPU
                 // ================================================
                 ST_IDLE: begin
-                    if (req) begin
+                    kill_walk <= 1'b0;
+                    if (req && !sfence_vma) begin
                         // Luu VA va access info
                         va_reg   <= va;
-                        acc_reg  <= access_type;
-                        priv_reg <= priv_mode;
+                        asid_reg <= satp_asid;
 
                         if (!translation_en) begin
                             // Bypass: M-mode hoac Bare → PA = VA[55:0]
@@ -202,12 +224,15 @@ module mmu64_top #(
                             // VA khong hop le (sign extension sai)
                             page_fault <= 1'b1;
                         end else if (tlb_hit) begin
-                            // TLB hit → tra PA ngay
-                            pa       <= tlb_pa;
-                            pa_valid <= 1'b1;
+                            if (tlb_perm_fault) begin
+                                page_fault <= 1'b1;
+                            end else begin
+                                // TLB hit → tra PA ngay
+                                pa       <= tlb_pa;
+                                pa_valid <= 1'b1;
+                            end
                         end else begin
                             // TLB miss → bat dau walk
-                            walk_start <= 1'b1;
                             state      <= ST_WALK;
                         end
                     end
@@ -217,22 +242,33 @@ module mmu64_top #(
                 //  WALK: cho walker hoan thanh
                 // ================================================
                 ST_WALK: begin
-                    if (walk_done) begin
-                        // Walk thanh cong → fill TLB va output PA
-                        tlb_we       <= 1'b1;
-                        tlb_wr_vpn   <= va_reg_vpn;
-                        tlb_wr_ppn   <= walk_ppn;
-                        tlb_wr_flags <= walk_flags;
-                        tlb_wr_pgsz  <= walk_pgsz;
+                    if (sfence_vma)
+                        kill_walk <= 1'b1;
 
-                        pa       <= walk_pa;
-                        pa_valid <= 1'b1;
+                    if (walk_done) begin
+                        if (!kill_walk && !sfence_vma) begin
+                            // Walk thanh cong → fill TLB va output PA
+                            tlb_we       <= 1'b1;
+                            tlb_wr_vpn   <= va_reg_vpn;
+                            tlb_wr_ppn   <= walk_ppn;
+                            tlb_wr_flags <= walk_flags;
+                            tlb_wr_pgsz  <= walk_pgsz;
+
+                            pa       <= walk_pa;
+                            pa_valid <= 1'b1;
+                        end
                         state    <= ST_IDLE;
                     end else if (walk_fault) begin
                         // Walk that bai → page fault
-                        page_fault <= 1'b1;
+                        if (!kill_walk && !sfence_vma)
+                            page_fault <= 1'b1;
                         state      <= ST_IDLE;
                     end
+                end
+
+                default: begin
+                    state     <= ST_IDLE;
+                    kill_walk <= 1'b0;
                 end
             endcase
         end
