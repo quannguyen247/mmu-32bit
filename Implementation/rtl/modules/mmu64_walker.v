@@ -2,10 +2,11 @@
 `include "mmu64_defs.vh"
 
 // ============================================================
-//  mmu64_walker — 3-Level Page Table Walker (Sv39)
-//  FSM di qua 3 cap: Level 2 → Level 1 → Level 0
-//  Ho tro gigapage (1GiB), megapage (2MiB), 4KiB page
-//  Kiem tra: V, W^R reserved, misaligned superpage, permission
+//  mmu64_walker - 3-level Sv39 page-table walker
+//  Optimized for low miss latency:
+//    * Start from a single-cycle walk_req pulse.
+//    * Process a PTE in the same cycle mem_valid is observed.
+//    * Avoid a dedicated PTE register / CHECK state.
 // ============================================================
 module mmu64_walker(
     input wire                    clk,
@@ -27,7 +28,7 @@ module mmu64_walker(
     output reg [7:0]              walk_flags,    // {D,A,G,U,X,W,R,V}
     output reg [1:0]              walk_page_size,// 0=4KiB, 1=2MiB, 2=1GiB
 
-    // --- Memory interface (doc PTE) ---
+    // --- Memory interface (read PTE) ---
     output reg                    mem_req,
     output reg [`PA_WIDTH-1:0]    mem_addr,
     input wire [`PTE_WIDTH-1:0]   mem_rdata,
@@ -35,25 +36,20 @@ module mmu64_walker(
 );
 
     // ---- FSM States (one-hot) ----
-    localparam [3:0] ST_IDLE  = 4'b0001;
-    localparam [3:0] ST_REQ   = 4'b0010;
-    localparam [3:0] ST_WAIT  = 4'b0100;
-    localparam [3:0] ST_CHECK = 4'b1000;
+    localparam [2:0] ST_IDLE = 3'b001;
+    localparam [2:0] ST_REQ  = 3'b010;
+    localparam [2:0] ST_WAIT = 3'b100;
 
-    reg [3:0] curr_state, next_state;
+    (* fsm_encoding = "one_hot" *) reg [2:0] curr_state, next_state;
     reg [1:0] level;                    // 2, 1, 0
 
     // ---- Registered inputs ----
     reg [`VPN_TOTAL_W-1:0] vpn_reg;
     reg [1:0]              acc_reg;
     reg [1:0]              priv_reg;
-    reg [`PPN_WIDTH-1:0]   satp_ppn_reg;
     reg                    sum_reg, mxr_reg;
 
-    // ---- PTE register ----
-    reg [`PTE_WIDTH-1:0]   pte_reg;
-
-    // ---- Base PPN cho moi level ----
+    // ---- Base PPN for current level ----
     reg [`PPN_WIDTH-1:0]   base_ppn;
 
     // ---- VPN fields ----
@@ -61,7 +57,7 @@ module mmu64_walker(
     wire [8:0] vpn1 = vpn_reg[17:9];
     wire [8:0] vpn0 = vpn_reg[8:0];
 
-    // ---- VPN field cho level hien tai ----
+    // ---- VPN field for current level ----
     reg [8:0] vpn_field;
     always @(*) begin
         case (level)
@@ -72,88 +68,80 @@ module mmu64_walker(
         endcase
     end
 
-    // ---- PTE Decoder ----
-    wire [`PPN_WIDTH-1:0] pte_ppn;
-    wire [25:0]           pte_ppn2;
-    wire [8:0]            pte_ppn1, pte_ppn0;
-    wire pte_v, pte_r, pte_w, pte_x, pte_u, pte_g, pte_a, pte_d;
-    wire pte_is_leaf, pte_is_pointer;
+    // ---- Decode the returned PTE directly from mem_rdata ----
+    wire [`PPN_WIDTH-1:0] pte_ppn       = mem_rdata[`PTE_PPN];
+    wire [8:0]            pte_ppn1      = mem_rdata[`PTE_PPN1];
+    wire [8:0]            pte_ppn0      = mem_rdata[`PTE_PPN0];
+    wire                  pte_v         = mem_rdata[`PTE_V];
+    wire                  pte_r         = mem_rdata[`PTE_R];
+    wire                  pte_w         = mem_rdata[`PTE_W];
+    wire                  pte_x         = mem_rdata[`PTE_X];
+    wire                  pte_u         = mem_rdata[`PTE_U];
+    wire                  pte_g         = mem_rdata[`PTE_G];
+    wire                  pte_a         = mem_rdata[`PTE_A];
+    wire                  pte_d         = mem_rdata[`PTE_D];
+    wire [9:0]            pte_rsvd_bits = mem_rdata[`PTE_RSVD];
 
-    mmu64_pte_decode u_decode(
-        .pte_in     (pte_reg),
-        .ppn        (pte_ppn),
-        .ppn2       (pte_ppn2),
-        .ppn1       (pte_ppn1),
-        .ppn0       (pte_ppn0),
-        .valid      (pte_v),
-        .readable   (pte_r),
-        .writable   (pte_w),
-        .executable (pte_x),
-        .user_mode  (pte_u),
-        .global_flag(pte_g),
-        .accessed   (pte_a),
-        .dirty      (pte_d),
-        .is_leaf    (pte_is_leaf),
-        .is_pointer (pte_is_pointer)
-    );
+    wire pte_is_leaf    = pte_v && (pte_r || pte_x);
+    wire pte_is_pointer = pte_v && !pte_r && !pte_w && !pte_x;
 
-    // ---- Permission Checker ----
+    // ---- Permission checker ----
     wire perm_fault;
-
     mmu64_perm_check u_perm(
-        .access_type(acc_reg),
-        .priv_mode  (priv_reg),
-        .pte_r      (pte_r),
-        .pte_w      (pte_w),
-        .pte_x      (pte_x),
-        .pte_u      (pte_u),
-        .pte_a      (pte_a),
-        .pte_d      (pte_d),
-        .mstatus_sum(sum_reg),
-        .mstatus_mxr(mxr_reg),
-        .fault      (perm_fault)
+        .access_type (acc_reg),
+        .priv_mode   (priv_reg),
+        .pte_r       (pte_r),
+        .pte_w       (pte_w),
+        .pte_x       (pte_x),
+        .pte_u       (pte_u),
+        .pte_a       (pte_a),
+        .pte_d       (pte_d),
+        .mstatus_sum (sum_reg),
+        .mstatus_mxr (mxr_reg),
+        .fault       (perm_fault)
     );
 
-    // ---- Kiem tra misaligned superpage ----
+    // ---- Superpage alignment ----
     reg misaligned;
     always @(*) begin
         misaligned = 1'b0;
         case (level)
-            2'd2: // Gigapage: PPN[1] va PPN[0] phai = 0
-                if (pte_ppn1 != 9'd0 || pte_ppn0 != 9'd0)
-                    misaligned = 1'b1;
-            2'd1: // Megapage: PPN[0] phai = 0
-                if (pte_ppn0 != 9'd0)
-                    misaligned = 1'b1;
-            default: ; // 4KiB: khong can kiem tra
+            2'd2:    misaligned = (pte_ppn1 != 9'd0) || (pte_ppn0 != 9'd0);
+            2'd1:    misaligned = (pte_ppn0 != 9'd0);
+            default: misaligned = 1'b0;
         endcase
     end
 
-    // ---- Kiem tra reserved PTE bits ----
-    wire reserved_encoding = pte_w && !pte_r;   // W=1, R=0 la reserved
-    wire rsvd_bits_set     = (pte_reg[`PTE_RSVD] != 10'd0);
+    // ---- Reserved PTE checks ----
+    wire reserved_encoding = pte_w && !pte_r;   // W=1, R=0 is reserved
+    wire rsvd_bits_set     = (pte_rsvd_bits != 10'd0);
+    wire pte_format_fault  = !pte_v || reserved_encoding || rsvd_bits_set;
 
-    // ---- Next-state logic (combinational) ----
+    // ---- Next-state logic ----
     always @(*) begin
         next_state = curr_state;
         case (curr_state)
-            ST_IDLE:  if (walk_req) next_state = ST_REQ;
-            ST_REQ:   next_state = ST_WAIT;
-            ST_WAIT:  if (mem_valid) next_state = ST_CHECK;
-            ST_CHECK: begin
-                if (!pte_v || reserved_encoding || rsvd_bits_set) begin
-                    next_state = ST_IDLE; // → fault
-                end else if (pte_is_leaf) begin
-                    next_state = ST_IDLE; // → done hoac fault
-                end else begin
-                    // Pointer: con level nao khong?
-                    if (level == 2'd0)
-                        next_state = ST_IDLE; // → fault (level 0 khong co pointer)
+            ST_IDLE: begin
+                if (walk_req)
+                    next_state = ST_REQ;
+            end
+
+            ST_REQ: begin
+                next_state = ST_WAIT;
+            end
+
+            ST_WAIT: begin
+                if (mem_valid) begin
+                    if (!pte_format_fault && pte_is_pointer && (level != 2'd0))
+                        next_state = ST_REQ;
                     else
-                        next_state = ST_REQ;  // → di xuong level tiep
+                        next_state = ST_IDLE;
                 end
             end
-            default: next_state = ST_IDLE;
+
+            default: begin
+                next_state = ST_IDLE;
+            end
         endcase
     end
 
@@ -162,11 +150,9 @@ module mmu64_walker(
         if (!rst_n) begin
             curr_state      <= ST_IDLE;
             level           <= 2'd2;
-            pte_reg         <= {`PTE_WIDTH{1'b0}};
             vpn_reg         <= {`VPN_TOTAL_W{1'b0}};
             acc_reg         <= 2'b00;
             priv_reg        <= 2'b00;
-            satp_ppn_reg    <= {`PPN_WIDTH{1'b0}};
             sum_reg         <= 1'b0;
             mxr_reg         <= 1'b0;
             base_ppn        <= {`PPN_WIDTH{1'b0}};
@@ -180,64 +166,54 @@ module mmu64_walker(
         end else begin
             curr_state <= next_state;
 
-            // Default: xoa pulse
             walk_done  <= 1'b0;
             walk_fault <= 1'b0;
             mem_req    <= 1'b0;
 
             case (curr_state)
-                // ---- IDLE: nhan yeu cau walk ----
                 ST_IDLE: begin
                     if (walk_req) begin
-                        vpn_reg      <= vpn;
-                        acc_reg      <= access_type;
-                        priv_reg     <= priv_mode;
-                        satp_ppn_reg <= satp_ppn;
-                        sum_reg      <= mstatus_sum;
-                        mxr_reg      <= mstatus_mxr;
-                        base_ppn     <= satp_ppn;
-                        level        <= 2'd2;
+                        vpn_reg  <= vpn;
+                        acc_reg  <= access_type;
+                        priv_reg <= priv_mode;
+                        sum_reg  <= mstatus_sum;
+                        mxr_reg  <= mstatus_mxr;
+                        base_ppn <= satp_ppn;
+                        level    <= 2'd2;
                     end
                 end
 
-                // ---- REQ: tinh dia chi PTE va gui yeu cau doc ----
                 ST_REQ: begin
                     mem_req  <= 1'b1;
                     mem_addr <= {base_ppn, vpn_field, 3'b000};
                 end
 
-                // ---- WAIT: cho du lieu tu bo nho ----
                 ST_WAIT: begin
-                    if (mem_valid)
-                        pte_reg <= mem_rdata;
-                end
-
-                // ---- CHECK: phan tich PTE ----
-                ST_CHECK: begin
-                    if (!pte_v || reserved_encoding || rsvd_bits_set) begin
-                        // PTE invalid hoac reserved encoding
-                        walk_fault <= 1'b1;
-                    end else if (pte_is_leaf) begin
-                        // Leaf PTE — kiem tra alignment va permission
-                        if (misaligned || perm_fault) begin
+                    if (mem_valid) begin
+                        if (pte_format_fault) begin
                             walk_fault <= 1'b1;
-                        end else begin
-                            walk_done      <= 1'b1;
-                            walk_ppn       <= pte_ppn;
-                            walk_flags     <= {pte_d, pte_a, pte_g, pte_u,
-                                               pte_x, pte_w, pte_r, pte_v};
-                            walk_page_size <= (level == 2'd2) ? 2'd2 :
-                                              (level == 2'd1) ? 2'd1 : 2'd0;
-                        end
-                    end else begin
-                        // Pointer PTE
-                        if (level == 2'd0) begin
-                            walk_fault <= 1'b1;
-                        end else begin
+                        end else if (pte_is_leaf) begin
+                            if (misaligned || perm_fault) begin
+                                walk_fault <= 1'b1;
+                            end else begin
+                                walk_done      <= 1'b1;
+                                walk_ppn       <= pte_ppn;
+                                walk_flags     <= {pte_d, pte_a, pte_g, pte_u,
+                                                   pte_x, pte_w, pte_r, pte_v};
+                                walk_page_size <= (level == 2'd2) ? 2'd2 :
+                                                  (level == 2'd1) ? 2'd1 : 2'd0;
+                            end
+                        end else if (pte_is_pointer && (level != 2'd0)) begin
                             base_ppn <= pte_ppn;
                             level    <= level - 2'd1;
+                        end else begin
+                            walk_fault <= 1'b1;
                         end
                     end
+                end
+
+                default: begin
+                    curr_state <= ST_IDLE;
                 end
             endcase
         end
