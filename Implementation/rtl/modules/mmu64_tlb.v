@@ -8,7 +8,6 @@
 //  - Write: synchronous (fill sau page-table walk)
 //  - Flush: dong bo (SFENCE.VMA)
 //  - Thay the: round-robin, uu tien entry invalid
-// ============================================================
 module mmu64_tlb #(
     parameter ENTRIES = `TLB_ENTRIES
 )(
@@ -18,6 +17,7 @@ module mmu64_tlb #(
     // --- Lookup (combinational) ---
     input wire [`VPN_TOTAL_W-1:0] lookup_vpn,       // {VPN2, VPN1, VPN0}
     input wire                    lookup_req,
+    input wire [15:0]             lookup_asid,
     output reg                    lookup_hit,
     output reg [`PPN_WIDTH-1:0]   lookup_ppn,
     output reg [7:0]              lookup_flags,      // {D,A,G,U,X,W,R,V}
@@ -29,6 +29,7 @@ module mmu64_tlb #(
     input wire [`PPN_WIDTH-1:0]   write_ppn,
     input wire [7:0]              write_flags,
     input wire [1:0]              write_page_size,
+    input wire [15:0]             write_asid,
 
     // --- Flush ---
     input wire                    flush
@@ -40,6 +41,7 @@ module mmu64_tlb #(
     reg [`PPN_WIDTH-1:0]   entry_ppn   [0:ENTRIES-1];
     reg [7:0]              entry_flags [0:ENTRIES-1];
     reg [1:0]              entry_pgsz  [0:ENTRIES-1];
+    reg [15:0]             entry_asid  [0:ENTRIES-1];
 
     // ---- Round-robin counter ----
     reg [`TLB_IDX_W-1:0] rr_ctr;
@@ -57,16 +59,19 @@ module mmu64_tlb #(
 
         for (i = 0; i < ENTRIES; i = i + 1) begin
             match[i] = 1'b0;
-            if (entry_valid[i]) begin
-                case (entry_pgsz[i])
-                    2'd0: // 4KiB — so khop toan bo 27-bit VPN
-                        match[i] = (entry_vpn[i] == lookup_vpn);
-                    2'd1: // 2MiB — so khop VPN[2] va VPN[1] (18 bit cao)
-                        match[i] = (entry_vpn[i][26:9] == lookup_vpn[26:9]);
-                    2'd2: // 1GiB — so khop VPN[2] (9 bit cao)
-                        match[i] = (entry_vpn[i][26:18] == lookup_vpn[26:18]);
-                    default: match[i] = 1'b0;
-                endcase
+            if (lookup_req && entry_valid[i]) begin
+                // So khop neu la trang Global (G=1) hoac ASID khop voi lookup_asid
+                if (entry_flags[i][`PTE_G] || (entry_asid[i] == lookup_asid)) begin
+                    case (entry_pgsz[i])
+                        2'd0: // 4KiB — so khop toan bo 27-bit VPN
+                            match[i] = (entry_vpn[i] == lookup_vpn);
+                        2'd1: // 2MiB — so khop VPN[2] va VPN[1] (18 bit cao)
+                            match[i] = (entry_vpn[i][26:9] == lookup_vpn[26:9]);
+                        2'd2: // 1GiB — so khop VPN[2] (9 bit cao)
+                            match[i] = (entry_vpn[i][26:18] == lookup_vpn[26:18]);
+                        default: match[i] = 1'b0;
+                    endcase
+                end
             end
         end
 
@@ -104,6 +109,7 @@ module mmu64_tlb #(
             entry_ppn[replace_idx]   <= write_ppn;
             entry_flags[replace_idx] <= write_flags;
             entry_pgsz[replace_idx]  <= write_page_size;
+            entry_asid[replace_idx]  <= write_asid;
             rr_ctr                   <= rr_ctr + 1'b1;
         end
     end
