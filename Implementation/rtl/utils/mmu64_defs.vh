@@ -1,9 +1,7 @@
 `ifndef MMU64_DEFS
 `define MMU64_DEFS
 
-// ============================================================
 //  Sv39 Address Widths
-// ============================================================
 `define VA_WIDTH        64
 `define PA_WIDTH        56
 `define PAGE_OFFSET_W   12
