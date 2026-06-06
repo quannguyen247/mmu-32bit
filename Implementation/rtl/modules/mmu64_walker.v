@@ -80,6 +80,7 @@ module mmu64_walker(
     wire                  pte_g         = mem_rdata[`PTE_G];
     wire                  pte_a         = mem_rdata[`PTE_A];
     wire                  pte_d         = mem_rdata[`PTE_D];
+    (* keep = "true" *) wire [1:0] pte_rsw_ignored = mem_rdata[`PTE_RSW];
     wire [9:0]            pte_rsvd_bits = mem_rdata[`PTE_RSVD];
 
     wire pte_is_leaf    = pte_v && (pte_r || pte_x);
