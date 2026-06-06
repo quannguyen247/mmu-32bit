@@ -5,14 +5,17 @@
 //  Test cases:
 //    1. TLB miss -> walk -> PA output (4KiB)
 //    2. TLB hit (truy cap lai cung page)
-//    3. 2MiB megapage translation
-//    4. 1GiB gigapage translation
-//    5. SFENCE.VMA -> flush -> TLB miss lai
-//    6. M-mode bypass (PA = VA)
-//    7. Bare mode bypass
-//    8. Invalid VA (sign extension sai) -> fault
-//    9. Permission fault (U-mode, S-page)
-//   10. Permission fault (store, read-only page)
+//    3. ASID isolation for same VPN
+//    4. 2MiB megapage translation
+//    5. 1GiB gigapage translation
+//    6. SFENCE.VMA -> flush -> TLB miss lai
+//    7. M-mode bypass (PA = VA)
+//    8. Bare mode bypass
+//    9. Invalid VA (sign extension sai) -> fault
+//   10. Permission fault (U-mode, S-page)
+//   11. Permission fault (store, read-only page)
+//   12. Read-only load fills TLB
+//   13. Permission fault on TLB-hit store
 // ============================================================
 module tb_mmu64_top;
 
@@ -80,6 +83,9 @@ module tb_mmu64_top;
     localparam ROOT_W = 13'h200;
     localparam L1_W   = 13'h400;
     localparam L0_W   = 13'h600;
+    localparam ROOT1_W = 13'h800;
+    localparam L1_1_W  = 13'hA00;
+    localparam L0_1_W  = 13'hC00;
 
     integer k;
     initial begin
@@ -95,6 +101,11 @@ module tb_mmu64_top;
         mem[L0_W + 0]   = make_pte(44'h00000000800, 1, 1, 1, 1, 0, 1, 1, 1);  // 4KiB RWXU AD
         mem[L0_W + 1]   = make_pte(44'h00000000801, 1, 0, 0, 1, 0, 1, 0, 1);  // 4KiB R-only U
         mem[L0_W + 3]   = make_pte(44'h00000000803, 1, 1, 1, 0, 0, 1, 1, 1);  // 4KiB RWX S-only
+
+        // Alternate address space for ASID isolation test
+        mem[ROOT1_W + 0] = make_pte(44'h005, 0, 0, 0, 0, 0, 0, 0, 1);          // pointer -> L1_1
+        mem[L1_1_W + 0]  = make_pte(44'h006, 0, 0, 0, 0, 0, 0, 0, 1);          // pointer -> L0_1
+        mem[L0_1_W + 0]  = make_pte(44'h00000000900, 1, 1, 1, 1, 0, 1, 1, 1);  // same VPN -> different PPN
     end
 
     // ---- Task: gui 1 request va kiem tra ----
@@ -175,8 +186,9 @@ module tb_mmu64_top;
     endtask
 
     // ---- SATP values ----
-    localparam [63:0] SATP_SV39 = {4'd8, 16'd0, 44'h001};
-    localparam [63:0] SATP_BARE = 64'h0;
+    localparam [63:0] SATP_SV39       = {4'd8, 16'd0, 44'h001};
+    localparam [63:0] SATP_SV39_ASID1 = {4'd8, 16'd1, 44'h004};
+    localparam [63:0] SATP_BARE       = 64'h0;
 
     // ---- Main test ----
     initial begin
@@ -208,6 +220,11 @@ module tb_mmu64_top;
         do_translate("TLB hit (cached)",
             64'h0000_0000_0000_0123, 2'b00, 2'b00, SATP_SV39,
             1, 56'h00_0000_0080_0123);
+
+        // Same VPN under a different ASID/root page table must not reuse ASID0 entry.
+        do_translate("ASID1 same VPN -> different PA",
+            64'h0000_0000_0000_0ABC, 2'b00, 2'b00, SATP_SV39_ASID1,
+            1, 56'h00_0000_0090_0ABC);
 
         // ============================================================
         //  Test 3: 2MiB megapage
@@ -281,6 +298,15 @@ module tb_mmu64_top;
         //  VA = 0x0000_0000_0000_1200
         // ============================================================
         do_translate("Store to read-only page -> fault",
+            64'h0000_0000_0000_1200, 2'b01, 2'b00, SATP_SV39,
+            0, 56'h0);
+
+        // Fill a read-only mapping, then ensure a store faults on TLB hit.
+        do_translate("Load read-only page -> fill TLB",
+            64'h0000_0000_0000_1200, 2'b00, 2'b00, SATP_SV39,
+            1, 56'h00_0000_0080_1200);
+
+        do_translate("TLB hit store to read-only page -> fault",
             64'h0000_0000_0000_1200, 2'b01, 2'b00, SATP_SV39,
             0, 56'h0);
 
