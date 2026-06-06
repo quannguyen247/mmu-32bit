@@ -4,7 +4,6 @@
 // ============================================================
 //  mmu64_pte_decode — Combinational PTE field decoder
 //  Trich xuat cac truong tu 64-bit PTE (Sv39)
-// ============================================================
 module mmu64_pte_decode(
     input wire [`PTE_WIDTH-1:0] pte_in,
 
@@ -20,6 +19,8 @@ module mmu64_pte_decode(
     output wire                  global_flag,
     output wire                  accessed,
     output wire                  dirty,
+    output wire [1:0]            rsw,        // RSW — reserved for software
+    output wire [9:0]            rsvd_bits,  // Reserved bits [63:54]
     output wire                  is_leaf,    // R=1 hoac X=1
     output wire                  is_pointer  // V=1, R=0, W=0, X=0
 );
@@ -39,6 +40,10 @@ module mmu64_pte_decode(
     assign global_flag = pte_in[`PTE_G];
     assign accessed    = pte_in[`PTE_A];
     assign dirty       = pte_in[`PTE_D];
+
+    // RSW va Reserved bits
+    assign rsw        = pte_in[`PTE_RSW];
+    assign rsvd_bits  = pte_in[`PTE_RSVD];
 
     // Leaf node: V=1 va (R=1 hoac X=1)
     assign is_leaf    = valid & (readable | executable);
